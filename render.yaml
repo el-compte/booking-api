@@ -1,0 +1,20 @@
+# One-click deploy on Render: New > Blueprint, then pick this repo.
+services:
+  - type: web
+    name: booking-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGODB_URI
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
