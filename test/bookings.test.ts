@@ -168,6 +168,73 @@ describe('cancelling', () => {
   });
 });
 
+describe('rescheduling', () => {
+  const reschedule = (id: string, start: string, end: string) =>
+    ctx.app.inject({
+      method: 'POST',
+      url: `/v1/bookings/${id}/reschedule`,
+      headers: bearer(token),
+      payload: { start: at(day, start), end: at(day, end) },
+    });
+
+  it('moves a booking and frees the old time', async () => {
+    const booking = (await book('10:00', '11:00')).json();
+    const moved = await reschedule(booking.id, '14:00', '15:00');
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json()).toMatchObject({ id: booking.id, rescheduledAt: expect.any(String) });
+    expect(new Date(moved.json().start).getTime()).toBe(new Date(at(day, '14:00')).getTime());
+
+    expect((await book('10:00', '11:00')).statusCode).toBe(201);
+    expect((await book('14:30', '15:00')).statusCode).toBe(409);
+  });
+
+  it('may overlap its own old time', async () => {
+    const booking = (await book('10:00', '11:00')).json();
+    expect((await reschedule(booking.id, '10:30', '11:30')).statusCode).toBe(200);
+  });
+
+  it('refuses a time taken by another booking', async () => {
+    const booking = (await book('10:00', '11:00')).json();
+    await book('12:00', '13:00');
+    const response = await reschedule(booking.id, '11:30', '12:30');
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe('slot_unavailable');
+    // The original time is untouched.
+    const fetched = await ctx.app.inject({
+      url: `/v1/bookings/${booking.id}`,
+      headers: bearer(token),
+    });
+    expect(fetched.json().start).toBe(booking.start);
+  });
+
+  it('lets only one of two bookings move into the same free time', async () => {
+    const first = (await book('09:00', '09:30')).json();
+    const second = (await book('09:30', '10:00')).json();
+    const codes = (
+      await Promise.all([
+        reschedule(first.id, '15:00', '16:00'),
+        reschedule(second.id, '15:30', '16:30'),
+      ])
+    ).map((r) => r.statusCode);
+    expect(codes.sort()).toEqual([200, 409]);
+  });
+
+  it('checks opening hours and refuses cancelled bookings', async () => {
+    const booking = (await book('10:00', '11:00')).json();
+    const late = await reschedule(booking.id, '16:30', '17:30');
+    expect(late.json().error.code).toBe('outside_opening_hours');
+
+    await ctx.app.inject({
+      method: 'POST',
+      url: `/v1/bookings/${booking.id}/cancel`,
+      headers: bearer(token),
+    });
+    const cancelled = await reschedule(booking.id, '14:00', '15:00');
+    expect(cancelled.statusCode).toBe(422);
+    expect(cancelled.json().error.code).toBe('booking_cancelled');
+  });
+});
+
 describe('listing', () => {
   it('filters and pages through bookings in start order', async () => {
     for (const start of ['13:00', '09:00', '11:00']) {

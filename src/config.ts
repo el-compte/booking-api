@@ -12,6 +12,11 @@ const envSchema = z.object({
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   CORS_ORIGIN: z.string().default('*'),
   PUBLIC_URL: z.url().optional(),
+  /** Optional. When set, rate-limit counters live in Redis so several instances share them. */
+  REDIS_URL: z.string().optional(),
+  WEBHOOK_WORKER_INTERVAL_MS: z.coerce.number().int().min(500).default(5000),
+  /** Allow webhooks to private/localhost URLs. Defaults to true outside production. */
+  WEBHOOK_ALLOW_PRIVATE_URLS: z.stringbool().optional(),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 });
 

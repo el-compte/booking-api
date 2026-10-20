@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import type { Redis } from 'ioredis';
 import { DateTime } from 'luxon';
-import { MongoClient } from 'mongodb';
+import { type Db, MongoClient } from 'mongodb';
 import { inject } from 'vitest';
 import { type App, buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
@@ -10,11 +11,15 @@ export const TIMEZONE = 'Europe/Paris';
 
 export interface TestContext {
   app: App;
+  db: Db;
   close: () => Promise<void>;
 }
 
 /** A fresh app with its own database, so test files never see each other's data. */
-export async function createTestApp(env: Record<string, string> = {}): Promise<TestContext> {
+export async function createTestApp(
+  env: Record<string, string> = {},
+  { redis }: { redis?: Redis } = {},
+): Promise<TestContext> {
   const client = new MongoClient(inject('mongoUri'));
   await client.connect();
   const db = client.db(`test_${randomUUID().slice(0, 8)}`);
@@ -29,11 +34,12 @@ export async function createTestApp(env: Record<string, string> = {}): Promise<T
     AUTH_RATE_LIMIT_MAX: '1000',
     ...env,
   });
-  const app = await buildApp({ config, db });
+  const app = await buildApp({ config, db, redis: redis ?? null });
   await app.ready();
 
   return {
     app,
+    db,
     close: async () => {
       await app.close();
       await db.dropDatabase();

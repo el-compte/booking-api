@@ -26,15 +26,26 @@ storefront built on this API.
 - **Free-slot lookup** for a calendar day, ready to show in a booking widget.
 - **Custom metadata** on resources (photos, prices, addresses), so a storefront can be built on
   the API alone.
+- **Rescheduling in one call.** A booking moves to its new time in a single atomic update, so it
+  can never end up double-booked or lose its old slot halfway.
+- **Signed webhooks.** Your servers get `booking.created`, `booking.cancelled` and
+  `booking.rescheduled` events, signed with HMAC-SHA256. Events are stored first and sent by a
+  background worker that retries failures with backoff, and URLs pointing at private networks are
+  refused in production.
+- **AI assistants can book.** A built-in [MCP](https://modelcontextprotocol.io) server lets
+  assistants like Claude list resources, check availability, book, reschedule and cancel, using
+  the same API key and the same booking rules.
 - **Safe retries.** Send an `Idempotency-Key` header and a retried request returns the original
   booking instead of creating a second one.
-- **Rate limiting** per account, with `x-ratelimit-*` and `retry-after` headers.
+- **Rate limiting** per account, with `x-ratelimit-*` and `retry-after` headers. Set `REDIS_URL`
+  and every instance shares the same counters.
 - **Consistent errors.** Every error has the same shape, a machine-readable `code` and a
   `requestId` you can find in the logs.
 - **Versioned routes** (`/v1`) and **OpenAPI 3.1 docs** generated from the same Zod schemas that
   validate requests, so the docs can't drift from the code.
 - **Cursor pagination** on list endpoints.
-- **53 automated tests** against a real (in-memory) MongoDB, run by GitHub Actions on every push.
+- **81 automated tests** against a real (in-memory) MongoDB, plus a real Redis in CI, run by
+  GitHub Actions on every push.
 
 ## Quick start
 
@@ -90,6 +101,11 @@ curl -s -X POST $API/bookings -H "x-api-key: $KEY" -H 'idempotency-key: order-10
 | `POST` `GET` | `/v1/bookings` | Book, or list bookings (filter by resource, status, time) |
 | `GET` | `/v1/bookings/{id}` | Get a booking |
 | `POST` | `/v1/bookings/{id}/cancel` | Cancel and free the slots |
+| `POST` | `/v1/bookings/{id}/reschedule` | Move to a new time in one step |
+| `POST` `GET` | `/v1/webhook-endpoints` | Subscribe a URL to events, or list subscriptions |
+| `DELETE` | `/v1/webhook-endpoints/{id}` | Unsubscribe |
+| `GET` | `/v1/webhook-endpoints/{id}/deliveries` | Recent deliveries, with status and errors |
+| `POST` | `/mcp` | MCP server for AI assistants (Streamable HTTP) |
 
 Errors look like this:
 
@@ -114,17 +130,64 @@ requests try to take the same unit, the database accepts one and rejects the oth
 turns into `409 slot_unavailable`. Cancelled bookings are left out of the index, so cancelling
 frees the slot straight away.
 
+## Webhooks
+
+Subscribe a URL, and store the `secret` from the response (it is shown only once):
+
+```bash
+curl -s -X POST $API/webhook-endpoints -H "x-api-key: $KEY" -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/hooks/bookings","events":["booking.created","booking.cancelled"]}'
+```
+
+Each event is a `POST` with a JSON body like
+`{ "id": "evt_…", "type": "booking.created", "createdAt": "…", "data": { "booking": { … } } }`.
+`booking.rescheduled` also includes `data.previous` with the old times. Answer with any `2xx`
+status. Anything else, or no answer within 10 seconds, is retried after 30s, 2m, 10m, 1h and 6h.
+
+Check the `Webhook-Signature` header (`t=<unix time>,v1=<hex>`) before trusting a request:
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+function isValid(header, rawBody, secret) {
+  const { t, v1 } = Object.fromEntries(header.split(',').map((p) => p.split('=')));
+  if (Math.abs(Date.now() / 1000 - Number(t)) > 300) return false; // too old: maybe a replay
+  const expected = createHmac('sha256', secret).update(`${t}.${rawBody}`).digest();
+  const given = Buffer.from(v1, 'hex');
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
+```
+
+`Webhook-Id` is the event id, so you can ignore an event you have already handled.
+
+## Use it from AI assistants (MCP)
+
+The API is also an MCP server at `/mcp`. Connect any MCP client with an API key. For example, in
+[Claude Code](https://claude.com/claude-code):
+
+```bash
+claude mcp add --transport http bookings https://YOUR-APP.onrender.com/mcp --header "X-API-Key: bk_..."
+```
+
+Then ask things like *"What's free in Chair 1 next Monday afternoon? Book 3pm for Alex."* The
+assistant gets six tools: `list_resources`, `check_availability`, `create_booking`,
+`list_bookings`, `reschedule_booking` and `cancel_booking`. They run through the same code as the
+REST API, so the same rules apply, and a refused booking comes back as an error the assistant can
+explain. You can also explore the tools with `npx @modelcontextprotocol/inspector`.
+
 ## Tests
 
 ```bash
-npm test          # 53 tests: unit tests plus HTTP tests against an in-memory MongoDB
+npm test          # 81 tests: unit tests plus HTTP tests against an in-memory MongoDB
 npm run lint      # Biome
 npm run typecheck
 ```
 
 The tests cover login and API keys, validation messages, overlapping and simultaneous
-bookings, idempotent retries, opening hours, daylight-saving days, pagination, rate limits and the
-generated docs.
+bookings, rescheduling races, idempotent retries, opening hours, daylight-saving days, pagination,
+signed webhook delivery and retries, rate limits shared through Redis, the MCP tools (through a
+real MCP client), and the generated docs. The shared-Redis test also runs against a real Redis
+when `REDIS_URL` is set, as it is in CI.
 
 ## Deploy for free
 
@@ -134,29 +197,36 @@ generated docs.
    `render.yaml` sets everything up and generates `JWT_SECRET`.
 3. Set `MONGODB_URI` to your Atlas connection string and `PUBLIC_URL` to your Render URL.
 
+One instance needs nothing else. To run several, add a Redis (for example Render Key Value) and
+set `REDIS_URL` so they share rate limits.
+
 A `Dockerfile` is also included for other hosts, such as Azure App Service, Fly.io or Railway.
 
 ## Project structure
 
 ```
 src/
-  app.ts            Fastify setup: docs, rate limits, error handling, /v1 routes
-  server.ts         Starts the server
+  app.ts            Fastify setup: docs, rate limits, error handling, /v1 and /mcp routes
+  server.ts         Starts the server and the webhook worker
   config.ts         Environment variables, validated at startup
   db.ts             Document types, collections and indexes
   errors.ts         Error format
   plugins/auth.ts   API key and access-token checks
   lib/schedule.ts   Opening hours, slot and overlap logic
-  modules/          auth, api-keys, resources, bookings routes
+  modules/
+    bookings/       Routes plus service.ts, the booking rules shared with MCP
+    resources/      Resources and free-slot lookup
+    webhooks/       Endpoints, signing, URL safety checks and the delivery worker
+    mcp/            MCP server and its tools
+    auth/, api-keys/
 test/               Vitest tests
 ```
 
 ## Ideas for next steps
 
-- MCP server so AI assistants can check availability and book
-- Webhooks when a booking is created or cancelled
-- Rescheduling a booking in one call
-- Redis store for rate limits when running several instances
+- OAuth for the MCP server, so assistants can connect without pasting an API key
+- Rotating webhook secrets without downtime
+- Email reminders to customers before their booking
 
 ## License
 

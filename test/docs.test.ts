@@ -21,10 +21,14 @@ describe('OpenAPI docs', () => {
       '/v1/bookings',
       '/v1/bookings/{id}',
       '/v1/bookings/{id}/cancel',
+      '/v1/bookings/{id}/reschedule',
       '/v1/me',
       '/v1/resources',
       '/v1/resources/{id}',
       '/v1/resources/{id}/availability',
+      '/v1/webhook-endpoints',
+      '/v1/webhook-endpoints/{id}',
+      '/v1/webhook-endpoints/{id}/deliveries',
     ]);
     expect(spec.paths['/v1/bookings'].post.security).toEqual([
       { apiKeyAuth: [] },

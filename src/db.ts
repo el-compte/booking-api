@@ -76,6 +76,47 @@ export interface BookingDoc {
   idempotencyKey: string | null;
   createdAt: Date;
   cancelledAt: Date | null;
+  rescheduledAt?: Date | null;
+}
+
+export const WEBHOOK_EVENTS = [
+  'booking.created',
+  'booking.cancelled',
+  'booking.rescheduled',
+] as const;
+export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
+
+export interface WebhookEndpointDoc {
+  _id: ObjectId;
+  accountId: ObjectId;
+  url: string;
+  events: WebhookEvent[];
+  /** Shared secret used to sign deliveries (HMAC-SHA256). */
+  secret: string;
+  createdAt: Date;
+}
+
+export type DeliveryStatus = 'pending' | 'delivered' | 'failed';
+
+/**
+ * One event to send to one endpoint. Deliveries are written to the database first
+ * (an outbox) and sent by a background worker, which retries failures with backoff.
+ */
+export interface WebhookDeliveryDoc {
+  _id: ObjectId;
+  accountId: ObjectId;
+  endpointId: ObjectId;
+  eventId: string;
+  type: WebhookEvent;
+  payload: Record<string, unknown>;
+  status: DeliveryStatus;
+  attempts: number;
+  nextAttemptAt: Date | null;
+  lockedUntil: Date | null;
+  lastError: string | null;
+  responseStatus: number | null;
+  createdAt: Date;
+  deliveredAt: Date | null;
 }
 
 export interface Collections {
@@ -83,6 +124,8 @@ export interface Collections {
   apiKeys: Collection<ApiKeyDoc>;
   resources: Collection<ResourceDoc>;
   bookings: Collection<BookingDoc>;
+  webhookEndpoints: Collection<WebhookEndpointDoc>;
+  webhookDeliveries: Collection<WebhookDeliveryDoc>;
 }
 
 export function getCollections(db: Db): Collections {
@@ -91,6 +134,8 @@ export function getCollections(db: Db): Collections {
     apiKeys: db.collection<ApiKeyDoc>('apiKeys'),
     resources: db.collection<ResourceDoc>('resources'),
     bookings: db.collection<BookingDoc>('bookings'),
+    webhookEndpoints: db.collection<WebhookEndpointDoc>('webhookEndpoints'),
+    webhookDeliveries: db.collection<WebhookDeliveryDoc>('webhookDeliveries'),
   };
 }
 
@@ -118,6 +163,14 @@ export async function ensureIndexes(collections: Collections): Promise<void> {
     ),
     collections.bookings.createIndex({ accountId: 1, start: 1, _id: 1 }),
     collections.bookings.createIndex({ resourceId: 1, status: 1, start: 1 }),
+    collections.webhookEndpoints.createIndex({ accountId: 1, createdAt: -1 }),
+    collections.webhookDeliveries.createIndex({ status: 1, nextAttemptAt: 1 }),
+    collections.webhookDeliveries.createIndex({ endpointId: 1, createdAt: -1 }),
+    // Keep delivery history for 30 days.
+    collections.webhookDeliveries.createIndex(
+      { createdAt: 1 },
+      { expireAfterSeconds: 30 * 24 * 60 * 60 },
+    ),
   ]);
 }
 

@@ -12,6 +12,7 @@ import {
   validatorCompiler,
   type ZodTypeProvider,
 } from 'fastify-type-provider-zod';
+import type { Redis } from 'ioredis';
 import type { Db } from 'mongodb';
 import { z } from 'zod';
 import type { Config } from './config.js';
@@ -20,19 +21,25 @@ import { ApiError, errorHandler } from './errors.js';
 import { apiKeyRoutes } from './modules/api-keys/routes.js';
 import { authRoutes } from './modules/auth/routes.js';
 import { bookingRoutes } from './modules/bookings/routes.js';
+import { mcpRoutes } from './modules/mcp/routes.js';
 import { resourceRoutes } from './modules/resources/routes.js';
+import { createWebhookDispatcher, type WebhookDispatcher } from './modules/webhooks/dispatcher.js';
+import { webhookRoutes } from './modules/webhooks/routes.js';
 import authPlugin from './plugins/auth.js';
 
 declare module 'fastify' {
   interface FastifyInstance {
     config: Config;
     collections: Collections;
+    webhooks: WebhookDispatcher;
   }
 }
 
 export interface AppOptions {
   config: Config;
   db: Db;
+  /** Shared rate-limit store. Without it, limits are counted in memory per instance. */
+  redis?: Redis | null;
 }
 
 const API_DESCRIPTION = `
@@ -43,6 +50,13 @@ with \`POST /v1/api-keys\` and send it in the \`X-API-Key\` header. Access token
 also work, in \`Authorization: Bearer <token>\`.
 
 **Errors** always look like \`{ "error": { "code", "message", "details?", "requestId" } }\`.
+
+**Webhooks** notify your servers when bookings are created, cancelled or rescheduled. Each
+request is signed: verify \`Webhook-Signature\` (\`t=<unix time>,v1=<HMAC-SHA256 of "t.body">\`)
+with your endpoint secret.
+
+**AI assistants** can use this API through its MCP server at \`/mcp\` (Streamable HTTP), with the
+same API key.
 
 **Rate limits** are per account (or per IP before you log in). Every response carries
 \`x-ratelimit-limit\`, \`x-ratelimit-remaining\` and \`x-ratelimit-reset\`; a \`429\` also has
@@ -56,7 +70,7 @@ function logger(config: Config): FastifyServerOptions['logger'] {
   return { level: config.LOG_LEVEL };
 }
 
-export async function buildApp({ config, db }: AppOptions) {
+export async function buildApp({ config, db, redis = null }: AppOptions) {
   const app = Fastify({
     logger: logger(config),
     genReqId: () => randomUUID(),
@@ -73,6 +87,15 @@ export async function buildApp({ config, db }: AppOptions) {
 
   app.decorate('config', config);
   app.decorate('collections', getCollections(db));
+  app.decorate(
+    'webhooks',
+    createWebhookDispatcher({
+      collections: app.collections,
+      log: app.log,
+      allowPrivateUrls: config.WEBHOOK_ALLOW_PRIVATE_URLS ?? config.NODE_ENV !== 'production',
+    }),
+  );
+  app.addHook('onClose', async () => app.webhooks.stop());
   app.addHook('onRequest', async (request, reply) => {
     reply.header('x-request-id', request.id);
   });
@@ -99,6 +122,9 @@ export async function buildApp({ config, db }: AppOptions) {
     keyGenerator: (request) =>
       request.auth ? `account:${request.auth.accountId.toHexString()}` : `ip:${request.ip}`,
     allowList: (request) => request.url === '/health' || request.url.startsWith('/docs'),
+    // With Redis, every instance shares the same counters. If Redis is down, let requests
+    // through rather than failing them.
+    ...(redis ? { redis, nameSpace: 'booking-api:rate-limit:', skipOnError: true } : {}),
     errorResponseBuilder: (_request, context) =>
       new ApiError(429, 'rate_limited', `Too many requests. Try again in ${context.after}.`),
   });
@@ -113,6 +139,7 @@ export async function buildApp({ config, db }: AppOptions) {
         { name: 'API keys', description: 'Keys for server-to-server access' },
         { name: 'Resources', description: 'Things that can be booked, and their free slots' },
         { name: 'Bookings', description: 'Reservations on a resource' },
+        { name: 'Webhooks', description: 'Get notified when bookings change' },
       ],
       components: {
         securitySchemes: {
@@ -148,12 +175,15 @@ export async function buildApp({ config, db }: AppOptions) {
 
   app.get('/', { schema: { hide: true } }, async (_request, reply) => reply.redirect('/docs'));
 
+  await app.register(mcpRoutes);
+
   await app.register(
     async (v1) => {
       await v1.register(authRoutes);
       await v1.register(apiKeyRoutes);
       await v1.register(resourceRoutes);
       await v1.register(bookingRoutes);
+      await v1.register(webhookRoutes);
     },
     { prefix: '/v1' },
   );

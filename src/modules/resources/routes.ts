@@ -1,14 +1,13 @@
 import type { FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
-import { DateTime } from 'luxon';
 import { ObjectId } from 'mongodb';
 import { z } from 'zod';
 import type { ResourceDoc } from '../../db.js';
 import { ApiError, errorResponses, notFound } from '../../errors.js';
 import { idParams, idSchema, toObjectId } from '../../lib/ids.js';
 import { decodeCursor, encodeCursor, pageSchema, paginationQuery } from '../../lib/pagination.js';
-import { freeSlots, localDay } from '../../lib/schedule.js';
 import { anyAuth, authOf } from '../../plugins/auth.js';
 import { createResourceBody, resourceSchema, toResource, updateResourceBody } from './schemas.js';
+import { availabilityFor, findResource as findResourceIn } from './service.js';
 
 const availabilitySchema = z
   .object({
@@ -25,17 +24,12 @@ const availabilitySchema = z
   })
   .meta({ id: 'Availability' });
 
-const MAX_DAYS_AHEAD = 366;
-
 export const resourceRoutes: FastifyPluginAsyncZod = async (app) => {
   const { resources, bookings } = app.collections;
   app.addHook('onRequest', app.authenticate);
 
-  async function findResource(accountId: ObjectId, id: string): Promise<ResourceDoc> {
-    const resource = await resources.findOne({ _id: toObjectId(id), accountId, archivedAt: null });
-    if (!resource) throw notFound('Resource');
-    return resource;
-  }
+  const findResource = (accountId: ObjectId, id: string) =>
+    findResourceIn(app.collections, accountId, id);
 
   app.post(
     '/resources',
@@ -184,39 +178,11 @@ export const resourceRoutes: FastifyPluginAsyncZod = async (app) => {
         response: { 200: availabilitySchema, ...errorResponses(400, 401, 404, 429) },
       },
     },
-    async (request) => {
-      const resource = await findResource(authOf(request).accountId, request.params.id);
-      const { date } = request.query;
-      const day = localDay(date, resource.timezone);
-      if (!day.start.isValid) throw new ApiError(400, 'invalid_date', 'date is not a valid day');
-      const today = DateTime.now().setZone(resource.timezone).startOf('day');
-      if (day.start.diff(today, 'days').days > MAX_DAYS_AHEAD) {
-        throw new ApiError(400, 'date_out_of_range', `date must be within ${MAX_DAYS_AHEAD} days`);
-      }
-
-      const booked = await bookings
-        .find(
-          {
-            resourceId: resource._id,
-            status: 'confirmed',
-            start: { $lt: day.end.toJSDate() },
-            end: { $gt: day.start.toJSDate() },
-          },
-          { projection: { units: 1 } },
-        )
-        .toArray();
-      const bookedUnits = new Set(booked.flatMap((b) => b.units.map((u) => u.getTime())));
-
-      return {
-        resourceId: resource._id.toHexString(),
-        date,
-        timezone: resource.timezone,
-        slotMinutes: resource.slotMinutes,
-        slots: freeSlots(resource, date, bookedUnits).map(({ start, end }) => ({
-          start: start.toISO({ suppressMilliseconds: true }) ?? '',
-          end: end.toISO({ suppressMilliseconds: true }) ?? '',
-        })),
-      };
-    },
+    async (request) =>
+      availabilityFor(
+        app.collections,
+        await findResource(authOf(request).accountId, request.params.id),
+        request.query.date,
+      ),
   );
 };
